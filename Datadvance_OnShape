@@ -1,0 +1,2357 @@
+#!/usr/bin/env python3
+
+import isodate
+import time
+import argparse
+import csv
+from simscale_sdk import *
+from onshape_client import *
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-k", "--api_key", help="SimScale API key", required=True)
+parser.add_argument("-u", "--api_url", help="SimScale API URL", default="https://api.simscale.com")
+
+parser.add_argument("-Cooling_channel_depth", help="Cooling channel depth in mm", default=20, type=float)
+parser.add_argument("-Pin_diameter", help="Pin diameter in mm", default=3, type=float)
+parser.add_argument("-Pin_row_offset", help="Pin row offset fraction 0 - 0.9", default=0, type=float)
+parser.add_argument("-Rows_in_X", help="Pin row count in the X direction with the offset row this becomes doubled", default=5, type=float)
+parser.add_argument("-Rows_in_Y", help="Pin row count in the Y direction", default=5, type=float)
+parser.add_argument("-flow_rate", help="Flow rate in m^3 per second up to max 0.001", default=0.00002, type=float)
+
+# This can currently not be computed, but also is not parameterized in the current Onshape model, so should be static.
+parser.add_argument("-inlet_area_sqm", help="Inlet area in m^2", default=0.00007854, type=float)
+
+parser.add_argument(
+    "-results_file",
+    help="Name of results file containing parameters, timestep, flow rate, pressure differential in psi, pressure differential in bar",
+    default="results",
+)
+parser.add_argument(
+    "-s", "--summary_mode", help="Summary mode - write only last timestep to results file", type=bool, default=False
+)
+
+parser.add_argument(
+    "-p", "--project_id", help="ID of project to run simulation in, by default a new one is created", type=int
+)
+parser.add_argument("-d", "--debug", help="Debugging output on", type=bool, default=True)
+
+args = parser.parse_args()
+
+# API client configuration
+api_key = args.api_key
+api_key_header = "X-API-KEY"
+configuration = Configuration()
+configuration.host = args.api_url + "/v0"
+configuration.api_key = {
+    api_key_header: api_key,
+}
+configuration.debug = args.debug
+
+onshape_client = Client()
+
+
+def get_entity_names(project_id, geometry_id, num=None, **kwargs):
+    entities = geometry_api.get_geometry_mappings(project_id, geometry_id, **kwargs)._embedded
+
+    if num is None or len(entities) == num:
+        return [e.name for e in entities]
+    else:
+        raise Exception(f"Found {len(entities)} entities instead of {num}: {entities}")
+
+
+def get_csv_for_result(result):
+    result_response = api_client.rest_client.GET(
+        url=result.download.url, headers={api_key_header: api_key}, _preload_content=False
+    )
+    return result_response.data.decode("utf-8")
+
+
+api_client = ApiClient(configuration)
+
+# API clients
+project_api = ProjectsApi(api_client)
+storage_api = StorageApi(api_client)
+geometry_import_api = GeometryImportsApi(api_client)
+geometry_api = GeometriesApi(api_client)
+mesh_operation_api = MeshOperationsApi(api_client)
+simulation_api = SimulationsApi(api_client)
+simulation_run_api = SimulationRunsApi(api_client)
+
+# Names mostly for objects in the workbench, can be anything
+result_area_average_name_inlet = "area_average_inlet"
+result_area_average_name_outlet = "area_average_outlet"
+result_forces_and_moments = "forces_and_moments"
+
+# Get Parasolid CAD from Onshape
+
+# Get these from the Onshape URL
+# https://cad.onshape.com/documents/7a6e02ed5c9ad459fe134acc/w/a1a4514d87da49e37c1e529a/e/b88b97137e3ac71d92675a81
+did = "7a6e02ed5c9ad459fe134acc"
+wid = "a1a4514d87da49e37c1e529a"
+eid = "b88b97137e3ac71d92675a81"
+
+config_string = "Cooling_channel_depth={} mm;Pin_diameter={} mm;Pin_row_offset={};Rows_in_X={};Rows_in_Y={}".format(
+    args.Cooling_channel_depth,
+    args.Pin_diameter,
+    args.Pin_row_offset,
+    args.Rows_in_X,
+    args.Rows_in_Y,
+)
+cad_file_name = "Cooling_channel_depth-{}_Pin_diameter-{}_Pin_row_offset-{}_Rows_in_X-{}_Rows_in_Y-{}.x_t".format(
+    args.Cooling_channel_depth,
+    args.Pin_diameter,
+    args.Pin_row_offset,
+    args.Rows_in_X,
+    args.Rows_in_Y,
+)
+
+ps = onshape_client.part_studios_api.export_ps1(did, "w", wid, eid, configuration=config_string, _preload_content=False)
+with open(cad_file_name, "wb") as file:
+    file.write(ps.data)
+file.close()
+
+# Set up simulation project
+
+project_id = args.project_id
+if project_id is None:
+    project = Project(
+        name="IGBT Geometry optimization with SimScale and Onshape",
+        description="IGBT Optimization example for SimScale API and Onshape",
+        measurement_system="SI",
+    )
+    project = project_api.create_project(project)
+    project_id = project.project_id
+    print(f"project_id: {project_id}")
+
+# Read project information and update with the deserialized model
+project = project_api.get_project(project_id)
+project_api.update_project(project_id, project)
+
+# Upload CAD data
+storage = storage_api.create_storage()
+with open(cad_file_name, "rb") as file:
+    api_client.rest_client.PUT(url=storage.url, headers={"Content-Type": "application/octet-stream"}, body=file.read())
+storage_id = storage.storage_id
+print(f"storage_id: {storage_id}")
+
+# Import CAD into SimScale
+geometry_import = GeometryImportRequest(
+    name=cad_file_name,
+    location=GeometryImportRequestLocation(storage_id),
+    format="PARASOLID",
+    input_unit="m",
+    options=GeometryImportRequestOptions(facet_split=False, sewing=False, improve=True, optimize_for_lbm_solver=False),
+)
+geometry_import = geometry_import_api.import_geometry(project_id, geometry_import)
+geometry_import_id = geometry_import.geometry_import_id
+geometry_import_start = time.time()
+while geometry_import.status not in ("FINISHED", "CANCELED", "FAILED"):
+    # adjust timeout for larger geometries
+    if time.time() > geometry_import_start + 900:
+        raise TimeoutError()
+    time.sleep(10)
+    geometry_import = geometry_import_api.get_geometry_import(project_id, geometry_import_id)
+    print(f"Geometry import status: {geometry_import.status}")
+geometry_id = geometry_import.geometry_id
+print(f"geometry_id: {geometry_id}")
+
+# Read geometry information and update with the deserialized model
+geometry = geometry_api.get_geometry(project_id, geometry_id)
+geometry_api.update_geometry(project_id, geometry_id, geometry)
+
+# ## Set names in the CAD for SimScale here
+# #############################################################################################################
+# # Here we are mapping original CAD names/IDs to internal ones generated by SimScale.
+
+# entity_flow_volume_id = get_entity_names(
+#     project_id, geometry_id, 1, _class="region", attributes=["SDL/TYSA_NAME"], values=["Part 1"]
+# )
+# entity_rotating_zone_id = get_entity_names(
+#     project_id, geometry_id, 1, _class="region", attributes=["SDL/TYSA_NAME"], values=["MRF"]
+# )
+entity_inlet_id = get_entity_names(
+     project_id, geometry_id, 1, _class="face", attributes=["SDL/TYSA_NAME"], values=["Inlet"]
+)
+entity_outlet_id = get_entity_names(
+    project_id, geometry_id, 1, _class="face", attributes=["SDL/TYSA_NAME"], values=["Outlet"]
+)
+# entity_wall_ids = get_entity_names(
+#     project_id, geometry_id, 3, _class="face", attributes=["SDL/TYSA_NAME"], values=["walls"]
+# )
+# # Only needed to identify blades - additional MRF faces we need to subtract
+# entity_rotating_zone_faces_id = get_entity_names(
+#     project_id, geometry_id, 4, _class="face", attributes=["SDL/TYSA_NAME"], values=["MRF"]
+# )
+
+# #---------------------------------------------------------------------------------------------- Extracted from sim
+
+model = CoupledConjugateHeatTransfer(
+        type="COUPLED_CONJUGATE_HEAT_TRANSFER",
+        connection_groups=[
+                FluidInterface(
+                        type="FLUID_INTERFACE",
+                        connections=[
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 1",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3229",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1431",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 2",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3234",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1490",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 3",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3239",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1549",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 4",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3244",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1608",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 5",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3249",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1667",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 6",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3254",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1726",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 7",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3259",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1785",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 8",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3264",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1844",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 9",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3269",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1903",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 10",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3274",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1962",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 11",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3279",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2021",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 12",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3284",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2080",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 13",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3289",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2139",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 14",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3294",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2198",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 15",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3299",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2257",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 16",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3304",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2316",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 17",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3309",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2375",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 18",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3314",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2434",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 19",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3319",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2493",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 20",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3324",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2552",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 21",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3329",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2611",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 22",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3334",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2670",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 23",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3339",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2729",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 24",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3344",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2788",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 25",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3349",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE2847",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 26",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3354",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3046",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 27",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3359",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3099",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 28",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3364",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3152",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 29",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3369",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3205",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 30",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3374",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3258",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 31",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3379",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3311",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 32",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3384",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3364",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 33",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3389",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3417",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 34",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3394",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3470",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 35",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3399",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3523",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 36",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3404",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3576",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 37",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3409",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3629",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 38",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3414",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3682",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 39",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3419",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3735",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 40",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3424",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3788",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 41",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3429",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3841",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 42",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3434",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3894",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 43",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3439",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE3947",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 44",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3444",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE4000",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 45",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3449",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE4053",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 46",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3454",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE4106",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 47",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3459",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE4159",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 48",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3464",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE4212",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 49",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3469",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE4265",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 50",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE3474",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE4318",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 51",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE845",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1170",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 52",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE697",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1161",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 53",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE222",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1153",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 54",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE1",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1149",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 55",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE420",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1145",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 56",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE422",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1141",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 57",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE416",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1137",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 58",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE418",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1133",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 59",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE404",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1129",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 60",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE406",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1125",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 61",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE398",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1121",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 62",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE400",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1117",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 63",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE402",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1113",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 64",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE408",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1109",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 65",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE410",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1105",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 66",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE412",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1101",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 67",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE414",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1097",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 68",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE424",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1093",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 69",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE660",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1089",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                                RegionInterface(
+                                        type="REGION_INTERFACE",
+                                        name="Standard interface 70",
+                                        interface_thermal=CoupledInterfaceThermal(
+                                                type="COUPLED",
+                                        ),
+                                        master_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B1_TE808",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        slave_topological_reference=TopologicalReference(
+                                                entities=[
+                                                        "B2_TE1085",
+                                                ],
+                                                sets=[],
+                                        ),
+                                        is_partial=False,
+                                        custom_modified=False,
+                                ),
+                        ],
+                ),
+        ],
+        model=FluidModel(
+                gravity=DimensionalVectorAcceleration(
+                        value=DecimalVector(
+                                x=9.81,
+                                y=0,
+                                z=0,
+                        ),
+                        unit="m/s²",
+                ),
+        ),
+        materials=CoupledConjugateHeatTransferMaterials(
+                fluids=[
+                        IncompressibleMaterial(
+                                type="INCOMPRESSIBLE",
+                                name="Water",
+                                viscosity_model=NewtonianViscosityModel(
+                                        type="NEWTONIAN",
+                                        kinematic_viscosity=DimensionalKinematicViscosity(
+                                                value=9.3379E-7,
+                                                unit="m²/s",
+                                        ),
+                                ),
+                                density=DimensionalDensity(
+                                        value=997.33,
+                                        unit="kg/m³",
+                                ),
+                                thermal_expansion_coefficient=DimensionalThermalExpansionRate(
+                                        value=2.07E-4,
+                                        unit="1/K",
+                                ),
+                                reference_temperature=DimensionalTemperature(
+                                        value=298.15,
+                                        unit="K",
+                                ),
+                                laminar_prandtl_number=6.5241,
+                                turbulent_prandtl_number=0.85,
+                                specific_heat=DimensionalSpecificHeat(
+                                        value=4180,
+                                        unit="J/(kg·K)",
+                                ),
+                                topological_reference=TopologicalReference(
+                                        entities=[
+                                                "B1_TE454",
+                                        ],
+                                        sets=[],
+                                ),
+                                built_in_material="builtInWater",
+                        ),
+                ],
+                solids=[
+                        SolidCompressibleMaterial(
+                                name="Aluminium",
+                                transport=ConstIsoTransport(
+                                        type="CONST_ISO",
+                                        conductivity=IsotropicConductivity(
+                                                type="ISOTROPIC",
+                                                thermal_conductivity=DimensionalFunctionThermalConductivity(
+                                                        value=ConstantFunction(
+                                                                type="CONSTANT",
+                                                                value=235,
+                                                        ),
+                                                        unit="W/(m·K)",
+                                                ),
+                                        ),
+                                        thermo=HConstThermo(
+                                                type="HCONST",
+                                                specific_heat=DimensionalSpecificHeat(
+                                                        value=897,
+                                                        unit="J/(kg·K)",
+                                                ),
+                                                equation_of_state=RhoConstEquationOfState(
+                                                        type="RHO_CONST",
+                                                        density=DimensionalDensity(
+                                                                value=2700,
+                                                                unit="kg/m³",
+                                                        ),
+                                                ),
+                                        ),
+                                ),
+                                topological_reference=TopologicalReference(
+                                        entities=[
+                                                "B2_TE254",
+                                        ],
+                                        sets=[],
+                                ),
+                                built_in_material="builtInAluminium",
+                        ),
+                ],
+        ),
+        initial_conditions=FluidInitialConditions(
+                gauge_pressure_rgh=DimensionalInitialConditionDomainsPressure(
+                        _global=DimensionalPressure(
+                                value=0,
+                                unit="Pa",
+                        ),
+                ),
+                velocity=DimensionalVectorInitialConditionDomainsSpeed(
+                        _global=DimensionalVectorSpeed(
+                                value=DecimalVector(
+                                        x=0,
+                                        y=0,
+                                        z=0,
+                                ),
+                                unit="m/s",
+                        ),
+                        subdomains=[],
+                ),
+                temperature=DimensionalInitialConditionDomainsTemperature(
+                        _global=DimensionalTemperature(
+                                value=19.85,
+                                unit="°C",
+                        ),
+                        subdomains=[],
+                ),
+        ),
+        boundary_conditions=[
+                VelocityInletBC(
+                        name="Velocity inlet",
+                        type="VELOCITY_INLET_V3",
+                        velocity=FlowRateInletVBC(
+                                type="FLOW_RATE_INLET_VELOCITY",
+                                flow_rate=VolumetricFlow(
+                                        type="VOLUMETRIC",
+                                        value=DimensionalFunctionVolumetricFlowRate(
+                                                value=ConstantFunction(
+                                                        type="CONSTANT",
+                                                        value=2.0E-5,
+                                                ),
+                                                unit="m³/s",
+                                        ),
+                                ),
+                        ),
+                        temperature=FixedValueTBC(
+                                type="FIXED_VALUE",
+                                value=DimensionalFunctionTemperature(
+                                        value=ConstantFunction(
+                                                type="CONSTANT",
+                                                value=19.85,
+                                        ),
+                                        unit="°C",
+                                ),
+                        ),
+          #Entity example ---------------------------------------------------------------
+              
+                        topological_reference=TopologicalReference(
+                                entities=entity_inlet_id
+                                ,
+                                sets=[],
+                        ),
+                ),
+                PressureOutletBC(
+                        name="Pressure outlet",
+                        type="PRESSURE_OUTLET_V30",
+                        gauge_pressure_rgh=FixedValuePBC(
+                                type="FIXED_VALUE",
+                                value=DimensionalFunctionPressure(
+                                        value=ConstantFunction(
+                                                type="CONSTANT",
+                                                value=0,
+                                        ),
+                                        unit="Pa",
+                                ),
+                        ),
+                        topological_reference=TopologicalReference(
+                                entities=entity_outlet_id
+                                ,
+                                sets=[],
+                        ),
+                ),
+                WallBC(
+                        name="IGBT Heat Surface",
+                        type="WALL_V34",
+                        velocity=NoSlipVBC(
+                                type="NO_SLIP",
+                        ),
+                        temperature=ExternalWallHeatFluxTBC(
+                                type="EXTERNAL_WALL_HEAT_FLUX_TEMPERATURE",
+                                heat_flux=FixedPowerHeatFlux(
+                                        type="FIXED_POWER",
+                                        value=DimensionalPower(
+                                                value=200,
+                                                unit="W",
+                                        ),
+                                ),
+                        ),
+                        topological_reference=TopologicalReference(
+                                entities=[
+                                        "B2_TE1",
+                                ],
+                                sets=[],
+                        ),
+                ),
+                WallBC(
+                        name="External Surfaces",
+                        type="WALL_V34",
+                        velocity=NoSlipVBC(
+                                type="NO_SLIP",
+                        ),
+                        temperature=ExternalWallHeatFluxTBC(
+                                type="EXTERNAL_WALL_HEAT_FLUX_TEMPERATURE",
+                                heat_flux=DerivedHeatFlux(
+                                        type="DERIVED",
+                                        heat_transfer_coefficient=DimensionalThermalTransmittance(
+                                                value=10,
+                                                unit="W/(K·m²)",
+                                        ),
+                                        ambient_temperature=DimensionalTemperature(
+                                                value=19.85,
+                                                unit="°C",
+                                        ),
+                                        wall_thermal=NoWallThermal(
+                                                type="NO_RESISTANCE",
+                                        ),
+                                ),
+                        ),
+                        topological_reference=TopologicalReference(
+                                entities=[
+                                        "B2_TE588",
+                                        "B2_TE4599",
+                                        "B2_TE570",
+                                        "B2_TE4578",
+                                        "B2_TE551",
+                                        "B2_TE4620",
+                                        "B2_TE547",
+                                        "B2_TE543",
+                                        "B2_TE4557",
+                                ],
+                                sets=[],
+                        ),
+                ),
+        ],
+        advanced_concepts=AdvancedConcepts(
+                power_sources=[],
+                momentum_sources=[],
+                thermal_resistance_networks=[],
+        ),
+        numerics=FluidNumerics(
+                relaxation_type="MANUAL",
+                relaxation_factor=RelaxationFactor(
+                        pressure_rgh_field=0.7,
+                        velocity_equation=0.3,
+                        temperature_equation=0.8,
+                ),
+                num_non_orthogonal_correctors=1,
+                solvers=FluidSolvers(
+                        velocity_solver=PBICGSolver(
+                                type="PBICG",
+                                absolute_tolerance=1.0E-15,
+                                relative_tolerance=0.01,
+                                preconditioner=DILUPreconditioner(
+                                        type="DILU",
+                                ),
+                        ),
+                        temperature_solver=PBICGSolver(
+                                type="PBICG",
+                                absolute_tolerance=1.0E-15,
+                                relative_tolerance=0.01,
+                                preconditioner=ILUCpPreconditioner(
+                                        type="ILUCP",
+                                        fill_in_level=1,
+                                ),
+                        ),
+                        pressure_rgh_solver=GAMGSolver(
+                                type="GAMG",
+                                absolute_tolerance=1.0E-15,
+                                relative_tolerance=0.01,
+                                smoother="GAUSSSEIDEL",
+                                num_pre_sweeps=1,
+                                num_post_sweeps=1,
+                                cache_agglomeration_on=True,
+                                num_cells_coarsest_level=100,
+                                num_merge_levels=1,
+                        ),
+                ),
+                schemes=Schemes(
+                        second_order_convection=False,
+                ),
+        ),
+        simulation_control=FluidSimulationControl(
+                end_time=DimensionalTime(
+                        value=1000,
+                        unit="s",
+                ),
+                delta_t=DimensionalTime(
+                        value=1,
+                        unit="s",
+                ),
+                write_control=TimeStepWriteControl(
+                        type="TIME_STEP",
+                        write_interval=1000,
+                ),
+                num_processors=-1,
+                max_run_time=DimensionalTime(
+                        value=10000,
+                        unit="s",
+                ),
+                decompose_algorithm=ScotchDecomposeAlgorithm(
+                        type="SCOTCH",
+                ),
+        ),
+        result_control=FluidResultControls(
+                surface_data=[
+                        AreaAverageResultControl(
+                                type="AREA_AVERAGE",
+                                name="IGBT Surface",
+                                write_control=TimeStepWriteControl(
+                                        type="TIME_STEP",
+                                        write_interval=10,
+                                ),
+                                topological_reference=TopologicalReference(
+                                        entities=[
+                                                "B2_TE1",
+                                        ],
+                                        sets=[],
+                                ),
+                        ),
+                        AreaAverageResultControl(
+                                type="AREA_AVERAGE",
+                                name="Inlet",
+                                write_control=TimeStepWriteControl(
+                                        type="TIME_STEP",
+                                        write_interval=10,
+                                ),
+                                topological_reference=TopologicalReference(
+                                        entities=[
+                                                "B1_TE689",
+                                        ],
+                                        sets=[],
+                                ),
+                        ),
+                        AreaAverageResultControl(
+                                type="AREA_AVERAGE",
+                                name="Outlet",
+                                write_control=TimeStepWriteControl(
+                                        type="TIME_STEP",
+                                        write_interval=10,
+                                ),
+                                topological_reference=TopologicalReference(
+                                        entities=[
+                                                "B1_TE837",
+                                        ],
+                                        sets=[],
+                                ),
+                        ),
+                ],
+                probe_points=[],
+                field_calculations=[],
+        ),
+        contact_handling_mode="AUTO",
+        is_compressible=False,
+        enable_radiation=False,
+        enable_solar_load=False,
+        turbulence_model="NONE",
+)
+model for mesh Mesh 1
+SimmetrixMeshingFluid(
+        type="SIMMETRIX_MESHING_FLUID_V16",
+        sizing=AutomaticMeshSizingSimmetrix(
+                type="AUTOMATIC_V9",
+                fineness=5,
+        ),
+        refinements=[],
+        automatic_layer_settings=AutomaticLayerOn(
+                type="AUTOMATIC_LAYER_ON",
+                number_of_layers=3,
+                total_relative_thickness=0.4,
+                layer_type=FractionalHeight2(
+                        type="FRACTIONAL_HEIGHT_2",
+                        growth_rate=1.5,
+                ),
+        ),
+        physics_based_meshing=True,
+        hex_core=True,
+        num_of_processors=-1,
+        advanced_simmetrix_settings=AdvancedSimmetrixFluidSettings(
+                small_feature_tolerance=DimensionalLength(
+                        value=1.0E-5,
+                        unit="m",
+                ),
+                gap_elements=0.05,
+                global_gradation_rate=1.22,
+        ),
+)
+# model for mesh Mesh 2
+# SimmetrixMeshingFluid(
+#         type="SIMMETRIX_MESHING_FLUID_V16",
+#         sizing=AutomaticMeshSizingSimmetrix(
+#                 type="AUTOMATIC_V9",
+#                 fineness=5,
+#         ),
+#         refinements=[],
+#         automatic_layer_settings=AutomaticLayerOn(
+#                 type="AUTOMATIC_LAYER_ON",
+#                 number_of_layers=3,
+#                 total_relative_thickness=0.4,
+#                 layer_type=FractionalHeight2(
+#                         type="FRACTIONAL_HEIGHT_2",
+#                         growth_rate=1.5,
+#                 ),
+#         ),
+#         physics_based_meshing=True,
+#         hex_core=True,
+#         num_of_processors=-1,
+#         advanced_simmetrix_settings=AdvancedSimmetrixFluidSettings(
+#                 small_feature_tolerance=DimensionalLength(
+#                         value=1.0E-5,
+#                         unit="m",
+#                 ),
+#                 gap_elements=0.05,
+#                 global_gradation_rate=1.22,
+#         ),
+# )
+
+# #---------------------------------------------------------------------------------------------- ^ Extracted from sim
+
+# simulation_spec = SimulationSpec(name=cad_file_name, geometry_id=geometry_id, model=model)
+# # Create simulation
+# simulation_id = simulation_api.create_simulation(project_id, simulation_spec).simulation_id
+# print(f"simulation_id: {simulation_id}")
+
+# # Start of mesh operation
+# mesh_operation = mesh_operation_api.create_mesh_operation(
+#     project_id,
+#     MeshOperation(
+#         name="Pump mesh",
+#         geometry_id=geometry_id,
+#         model=SimmetrixMeshingFluid(
+                type="SIMMETRIX_MESHING_FLUID_V16",
+                sizing=AutomaticMeshSizingSimmetrix(
+                        type="AUTOMATIC_V9",
+                        fineness=5,
+                ),
+                refinements=[],
+                automatic_layer_settings=AutomaticLayerOn(
+                        type="AUTOMATIC_LAYER_ON",
+                        number_of_layers=3,
+                        total_relative_thickness=0.4,
+                        layer_type=FractionalHeight2(
+                                type="FRACTIONAL_HEIGHT_2",
+                                growth_rate=1.5,
+                        ),
+                ),
+                physics_based_meshing=True,
+                hex_core=True,
+                num_of_processors=-1,
+                advanced_simmetrix_settings=AdvancedSimmetrixFluidSettings(
+                        small_feature_tolerance=DimensionalLength(
+                                value=1.0E-5,
+                                unit="m",
+                        ),
+                        gap_elements=0.05,
+                        global_gradation_rate=1.22,
+                ),
+        )
+    
+#         ),
+#     ),
+# )
+# mesh_operation_api.update_mesh_operation(project_id, mesh_operation.mesh_operation_id, mesh_operation)
+# mesh_operation_id = mesh_operation.mesh_operation_id
+
+# mesh_check = mesh_operation_api.check_mesh_operation_setup(project_id, mesh_operation_id, simulation_id=simulation_id)
+# warnings = [entry for entry in mesh_check.entries if entry.severity == "WARNING"]
+# print(f"Meshing check warnings: {warnings}")
+# errors = [entry for entry in mesh_check.entries if entry.severity == "ERROR"]
+# if errors:
+#     raise Exception("Meshing check failed", mesh_check)
+
+# # Estimate Meshing
+# try:
+#     mesh_estimation = mesh_operation_api.estimate_mesh_operation(project_id, mesh_operation_id)
+#     print(f"Meshing estimation: {mesh_estimation}")
+#     too_expensive = mesh_estimation.compute_resource.value > 10.0
+#     if too_expensive:
+#         raise Exception("Too expensive", mesh_estimation)
+#     mesh_max_runtime = isodate.parse_duration(mesh_estimation.duration.interval_max).total_seconds()
+#     mesh_max_runtime = mesh_max_runtime + 600  # 10 min buffer
+# except ApiException as ae:
+#     if ae.status == 422:
+#         mesh_max_runtime = 36000
+#         print(f"Meshing estimation not available, assuming max runtime of {mesh_max_runtime} seconds")
+#     else:
+#         raise ae
+
+# mesh_operation_api.start_mesh_operation(project_id, mesh_operation_id, simulation_id=simulation_id)
+
+# # Wait until the meshing operation is complete
+# mesh_operation = mesh_operation_api.get_mesh_operation(project_id, mesh_operation_id)
+# mesh_operation_start = time.time()
+# while mesh_operation.status not in ("FINISHED", "CANCELED", "FAILED"):
+#     if time.time() > mesh_operation_start + mesh_max_runtime:
+#         raise TimeoutError()
+#     time.sleep(30)
+#     mesh_operation = mesh_operation_api.get_mesh_operation(project_id, mesh_operation_id)
+#     print(f"Meshing run status: {mesh_operation.status} - {100* mesh_operation.progress:.2f}%")
+
+# mesh_operation = mesh_operation_api.get_mesh_operation(project_id, mesh_operation_id)
+# print(f"final mesh_operation: {mesh_operation}")
+
+# # Get the simulation spec and update it with mesh_id from the previous mesh operation
+# simulation_spec = simulation_api.get_simulation(project_id, simulation_id)
+# simulation_spec.mesh_id = mesh_operation.mesh_id
+# simulation_api.update_simulation(project_id, simulation_id, simulation_spec)
+
+# # Check simulation for setup issues
+# check = simulation_api.check_simulation_setup(project_id, simulation_id)
+# warnings = [entry for entry in check.entries if entry.severity == "WARNING"]
+# print(f"Simulation check warnings: {warnings}")
+# errors = [entry for entry in check.entries if entry.severity == "ERROR"]
+# if errors:
+#     raise Exception("Simulation check failed", check)
+
+# # Estimate simulation
+# try:
+#     estimation = simulation_api.estimate_simulation_setup(project_id, simulation_id)
+#     print(f"Simulation estimation: {estimation}")
+#     too_expensive = estimation.compute_resource.value > 30.0
+#     if too_expensive:
+#         raise Exception("Too expensive", estimation)
+#     max_runtime = isodate.parse_duration(estimation.duration.interval_max).total_seconds()
+#     max_runtime = max_runtime + 600  # 10 min buffer
+# except ApiException as ae:
+#     if ae.status == 422:
+#         max_runtime = 36000
+#         print(f"Simulation estimation not available, assuming max runtime of {max_runtime} seconds")
+#     else:
+#         raise ae
+
+# # Create simulation run
+# simulation_run = SimulationRun(name="Run 1")
+# simulation_run = simulation_run_api.create_simulation_run(project_id, simulation_id, simulation_run)
+# run_id = simulation_run.run_id
+# print(f"runId: {run_id}")
+
+# # Read simulation run and update with the deserialized model
+# simulation_run = simulation_run_api.get_simulation_run(project_id, simulation_id, run_id)
+# simulation_run_api.update_simulation_run(project_id, simulation_id, run_id, simulation_run)
+
+
+# # Start simulation run and wait until it's finished
+# simulation_run_api.start_simulation_run(project_id, simulation_id, run_id)
+# simulation_run = simulation_run_api.get_simulation_run(project_id, simulation_id, run_id)
+# simulation_run_start = time.time()
+# while simulation_run.status not in ("FINISHED", "CANCELED", "FAILED"):
+#     if time.time() > simulation_run_start + max_runtime * 1.5:
+#         raise TimeoutError()
+#     time.sleep(30)
+#     simulation_run = simulation_run_api.get_simulation_run(project_id, simulation_id, run_id)
+#     print(f"Simulation run status: {simulation_run.status} - {100 * simulation_run.progress:.2f}%")
+
+# # Get result metadata
+# results = simulation_run_api.get_simulation_run_results(project_id, simulation_id, run_id)
+# print(f"results: {results}")
+
+# # Calculate flow rates, pressure differentials and efficiency
+# inlet_velocities = []
+# inlet_pressures = []
+# outlet_pressures = []
+# forces_moments = []
+# combined_results = []
+
+# inlet_average_ux_csv = get_csv_for_result(
+#     [
+#         r
+#         for r in results._embedded
+#         if (r.category == "AREA_AVERAGE" and r.name == result_area_average_name_inlet and r.quantity == "Ux")
+#     ][0]
+# )
+# with open(f"{args.results_file}_{result_area_average_name_inlet}_Ux.csv", "w") as file:
+#     file.write(inlet_average_ux_csv)
+# with open(f"{args.results_file}_{result_area_average_name_inlet}_Ux.csv", "r") as file:
+#     reader = csv.reader(file, delimiter=",")
+#     next(reader, None)
+#     for row in reader:
+#         inlet_velocities.append(row)
+
+# inlet_average_p_csv = get_csv_for_result(
+#     [
+#         r
+#         for r in results._embedded
+#         if (r.category == "AREA_AVERAGE" and r.name == result_area_average_name_inlet and r.quantity == "p")
+#     ][0]
+# )
+# with open(f"{args.results_file}_{result_area_average_name_inlet}_p.csv", "w") as file:
+#     file.write(inlet_average_p_csv)
+# with open(f"{args.results_file}_{result_area_average_name_inlet}_p.csv", "r") as file:
+#     reader = csv.reader(file, delimiter=",")
+#     next(reader, None)
+#     for row in reader:
+#         inlet_pressures.append(row)
+
+# outlet_average_p_csv = get_csv_for_result(
+#     [
+#         r
+#         for r in results._embedded
+#         if (r.category == "AREA_AVERAGE" and r.name == result_area_average_name_outlet and r.quantity == "p")
+#     ][0]
+# )
+# with open(f"{args.results_file}_{result_area_average_name_outlet}_p.csv", "w") as file:
+#     file.write(outlet_average_p_csv)
+# with open(f"{args.results_file}_{result_area_average_name_outlet}_p.csv", "r") as file:
+#     reader = csv.reader(file, delimiter=",")
+#     next(reader, None)
+#     for row in reader:
+#         outlet_pressures.append(row)
+
+# forces_moments_csv = get_csv_for_result(
+#     [r for r in results._embedded if (r.category == "FORCE_PLOT" and r.name == result_forces_and_moments)][0]
+# )
+# with open(f"{args.results_file}_{result_forces_and_moments}.csv", "w") as file:
+#     file.write(forces_moments_csv)
+# with open(f"{args.results_file}_{result_forces_and_moments}.csv", "r") as file:
+#     reader = csv.reader(file, delimiter=",")
+#     next(reader, None)
+#     for row in reader:
+#         forces_moments.append(row)
+
+# timesteps = len(inlet_velocities)
+# for i in range(timesteps):
+#     timestep = inlet_velocities[i][0]
+
+#     inlet_velocity_meters_per_second = float(inlet_velocities[i][1])
+#     inlet_pressure_pa = float(inlet_pressures[i][1])
+#     outlet_pressure_pa = float(outlet_pressures[i][1])
+#     pressure_moment_x = float(forces_moments[i][10])
+#     viscous_moment_x = float(forces_moments[i][16])
+
+#     inlet_pressure_psi = inlet_pressure_pa * 0.0001450377
+#     outlet_pressure_psi = outlet_pressure_pa * 0.0001450377
+#     inlet_pressure_bar = inlet_pressure_pa / 100000
+#     outlet_pressure_bar = outlet_pressure_pa / 100000
+
+#     pressure_diff_psi = abs(inlet_pressure_psi - outlet_pressure_psi)
+#     pressure_diff_bar = abs(inlet_pressure_bar - outlet_pressure_bar)
+#     pressure_diff_pa = abs(inlet_pressure_pa - outlet_pressure_pa)
+
+#     # since we specify the flow rate as BC, this is more a validation
+#     inlet_flow_rate_cubic_meters_per_second = args.inlet_area_sqm * inlet_velocity_meters_per_second
+
+#     power_in = abs(angular_velocity * (pressure_moment_x + viscous_moment_x))
+#     power_out = abs(args.flow_rate * pressure_diff_pa)
+#     efficiency = power_out / power_in
+
+#     combined_results.append(
+#         [
+#             blade_count,
+#             args.blade_angle,
+#             args.blade_thickness,
+#             args.blade_radius,
+#             args.diffuser_length,
+#             args.diffuser_angle,
+#             args.inlet_length,
+#             timestep,
+#             inlet_flow_rate_cubic_meters_per_second,
+#             pressure_diff_psi,
+#             pressure_diff_bar,
+#             pressure_moment_x,
+#             viscous_moment_x,
+#             power_out,
+#             power_in,
+#             efficiency,
+#         ]
+#     )
+
+# with open(f"{args.results_file}.csv", "w") as file:
+#     writer = csv.writer(file, delimiter=",")
+#     if args.summary_mode:
+#         # only write last timestep, no header
+#         writer.writerow(combined_results[-1])
+#     else:
+#         writer.writerow(
+#             [
+#                 "pump_blades",
+#                 "bAngle",
+#                 "bTh",
+#                 "bRadius",
+#                 "diffL",
+#                 "diffA",
+#                 "inletL",
+#                 "timestep",
+#                 "inlet flow rate cubic meters/s",
+#                 "pressure diff psi",
+#                 "pressure diff bar",
+#                 "pressure moment x",
+#                 "viscous moment x",
+#                 "power out",
+#                 "power_in",
+#                 "efficiency",
+#             ]
+#         )
+#         writer.writerows(combined_results)
